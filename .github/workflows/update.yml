@@ -1,0 +1,114 @@
+name: Mirror OnlineFix Database via FlareSolverr
+
+on:
+  schedule:
+    # Runs automatically twice a day (at 00:00 and 12:00 UTC)
+    - cron: '0 0,12 * * *'
+  workflow_dispatch: # Manual trigger button
+
+jobs:
+  update-mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Start FlareSolverr Container
+        run: |
+          docker run -d \
+            --name=flaresolverr \
+            -p 8191:8191 \
+            -e LOG_LEVEL=info \
+            --restart unless-stopped \
+            ghcr.io/flaresolverr/flaresolverr:latest
+
+      - name: Wait for FlareSolverr Readiness
+        run: |
+          echo "Waiting for FlareSolverr to initialize..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8191/ > /dev/null; then
+              echo "FlareSolverr is ready!"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Fetch and Parse JSON via FlareSolverr
+        run: |
+          python3 -c "
+          import urllib.request
+          import json
+          import re
+          import sys
+
+          flaresolverr_url = 'http://localhost:8191/v1'
+          payload = {
+              'cmd': 'request.get',
+              'url': 'https://hydralinks.cloud/sources/onlinefix.json',
+              'maxTimeout': 60000
+          }
+
+          req = urllib.request.Request(
+              flaresolverr_url,
+              data=json.dumps(payload).encode('utf-8'),
+              headers={'Content-Type': 'application/json'}
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=70) as response:
+                  res_data = json.loads(response.read().decode('utf-8'))
+                  
+              if res_data.get('status') == 'ok':
+                  html_response = res_data['solution']['response']
+                  
+                  # Chromium wraps raw JSON in <pre>...</pre> tags when loading JSON in a browser
+                  match = re.search(r'<pre[^>]*>(.*?)</pre>', html_response, re.DOTALL)
+                  raw_json_str = match.group(1) if match else html_response
+
+                  # Clean HTML entities if Chromium escaped quotes
+                  raw_json_str = raw_json_str.replace('&quot;', '\"').replace('&amp;', '&')
+
+                  # Validate JSON syntax
+                  parsed_json = json.loads(raw_json_str)
+
+                  with open('onlinefix.json', 'w', encoding='utf-8') as f:
+                      json.dump(parsed_json, f, indent=2)
+
+                  print('[+] Successfully extracted and saved onlinefix.json')
+              else:
+                  print(f'::error::FlareSolverr status: {res_data.get(\"status\")}', file=sys.stderr)
+                  sys.exit(1)
+
+          except Exception as e:
+              print(f'::error::Failed to solve challenge: {e}', file=sys.stderr)
+              sys.exit(1)
+          "
+
+      - name: Validate JSON Payload
+        run: |
+          if ! jq empty onlinefix.json 2>/dev/null; then
+            echo "::error::Downloaded payload is not valid JSON. Aborting update."
+            exit 1
+          fi
+
+      - name: Commit and Push Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          if git status --porcelain | grep -q "onlinefix.json"; then
+            git add onlinefix.json
+            git commit -m "chore: auto-update onlinefix.json via FlareSolverr [skip ci]"
+            git push
+            echo "Successfully updated onlinefix.json"
+          else
+            echo "No database changes detected."
+          fi
